@@ -383,18 +383,10 @@
     },
     "ProduceChooseIdolFlag": {
         "recognition": {
-            "type": "TemplateMatch",
-            "param": {
-                "template": [
-                    "produce/choose_idol.png"
-                ]
-            }
-        },
-        "action": {
-            "type": "Click",
+            "type": "DirectHit",
             "param": {}
         },
-        "post_wait_freezes": 200,
+        "pre_wait_freezes": 300,
         "next": [
             "ProduceChooseIdolFind"
         ]
