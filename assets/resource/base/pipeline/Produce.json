@@ -396,50 +396,27 @@
         },
         "post_wait_freezes": 200,
         "next": [
-            "ProduceChooseIdolFirst"
+            "ProduceChooseIdolFind"
         ]
     },
-    "ProduceChooseIdolFirst": {
+    "ProduceChooseIdolFind": {
         "recognition": {
-            "type": "TemplateMatch",
-            "param": {
-                "template": "produce/decide.png"
-            }
-        },
-        "action": {
-            "type": "Click",
-            "param": {
-                "target": [
-                    45,
-                    610,
-                    120,
-                    150
-                ]
-            }
-        },
-        "post_wait_freezes": 200,
-        "next": [
-            "ProduceChooseIdolFirstDecide"
-        ]
-    },
-    "ProduceChooseIdolFirstDecide": {
-        "recognition": {
-            "type": "TemplateMatch",
-            "param": {
-                "template": "produce/decide.png"
-            }
-        },
-        "action": {
-            "type": "Click",
+            "type": "DirectHit",
             "param": {}
         },
-        "post_wait_freezes": 200,
+        "action": {
+            "type": "Custom",
+            "param": {
+                "custom_action": "ProduceChooseIdolFind",
+                "custom_action_param": ""
+            }
+        },
+        "pre_wait_freezes": 300,
         "focus": {
             "Node.Action.Succeeded": "[color:DeepSkyBlue]已找到偶像卡[/color]"
         },
         "next": [
-            "ProduceChooseIdol",
-            "[JumpBack]ProduceChooseNextIdol"
+            "ProduceChooseIdolNext"
         ]
     },
     "ProduceChooseIdol": {
@@ -485,24 +462,6 @@
         "next": [
             "ProduceChooseSupport"
         ]
-    },
-    "ProduceChooseNextIdol": {
-        "recognition": {
-            "type": "DirectHit",
-            "param": {}
-        },
-        "action": {
-            "type": "Click",
-            "param": {
-                "target": [
-                    322,
-                    804,
-                    118,
-                    186
-                ]
-            }
-        },
-        "post_wait_freezes": 200
     },
     "ProduceChooseSupport": {
         "recognition": {

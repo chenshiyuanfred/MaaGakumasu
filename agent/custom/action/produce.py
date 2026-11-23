@@ -5,6 +5,13 @@ from typing import Any, Dict, List, Optional
 from collections import Counter
 
 from utils import logger
+from idol_match import (
+    SIMILARITY_THRESHOLD,
+    best_match,
+    line_candidates,
+    similarity_ratio,
+    song_similarity_ratio,
+)
 from maa.context import Context
 from maa.custom_action import CustomAction
 from maa.agent.agent_server import AgentServer
@@ -1295,3 +1302,310 @@ class ProduceKeepDrinkAuto(CustomAction):
                 time.sleep(0.1)
             context.run_task("ProduceDrinkNoButton")
         return True
+
+
+@AgentServer.custom_action("ProduceChooseIdolFind")
+class ProduceChooseIdolFind(CustomAction):
+    """
+    在「选择偶像」页把列表筛选成指定偶像，再逐张读卡片顶部信息找到指定歌曲。
+
+    流程：点底部「偶像」→ 切到「筛选」→ 上滑到「偶像」分组 → 全部解除 →
+    勾选目标偶像 → 确定 → 进「概览」宫格 → 逐张点开读顶部（单次 OCR）→
+    命中后点确定 → 回到选择页再读一次顶部复验；翻页用纵向滑动，到底自动停。
+    """
+
+    # 选择偶像页底部「偶像」按钮（打开 排序·筛选）
+    IDOL_DIALOG_POINT = (508, 740)
+    # 弹窗内「筛选」页签
+    FILTER_TAB_POINT = (505, 1035)
+    # 弹窗内「确定」按钮
+    DIALOG_CONFIRM_POINT = (505, 1160)
+    # 弹窗内容上滑，露出「偶像」分组
+    FILTER_SCROLL_FROM = (400, 900)
+    FILTER_SCROLL_TO = (400, 450)
+
+    # 筛选弹窗内容区域
+    DIALOG_ROI = [0, 260, 720, 1030]
+    # 弹窗内勾选框相对名称文本的偏移（保留用于兼容旧逻辑）
+    CHECKBOX_OFFSET_X = 30
+    # 偶像两列勾选框的固定横坐标
+    LEFT_CHECKBOX_X = 81
+    RIGHT_CHECKBOX_X = 532
+
+    # 宫格内卡片的点击位置（4 列 x 2 行）
+    CARD_SLOTS = [
+        (115, 655),
+        (285, 655),
+        (460, 655),
+        (635, 655),
+        (115, 895),
+        (285, 895),
+        (460, 895),
+        (635, 895),
+    ]
+
+    # 底部「确定」按钮
+    CONFIRM_POINT = (355, 1097)
+    # 选择页左下角「概览」按钮
+    OVERVIEW_POINT = (77, 745)
+    # 向上滑动翻页
+    SWIPE_FROM = (360, 950)
+    SWIPE_TO = (360, 620)
+
+    # 顶部信息区域：宫格页靠左、选择页靠右，取并集
+    PANEL_ROI = [90, 20, 620, 220]
+    # 确认后在选择页校验名称的区域
+    CONFIRM_CHECK_ROI = [380, 60, 340, 180]
+    # 卡格区域，用于判断翻页是否生效
+    GRID_ROI = [0, 500, 720, 1020]
+
+    MAX_PAGES = 10
+    CLICK_DELAY = 0.45
+    SWIPE_DELAY = 0.7
+    CONFIRM_DELAY = 0.9
+    DIALOG_DELAY = 1.0
+
+    # ---------------------------------------------------------------- helpers
+
+    def _load_params(self, context: Context, argv):
+        params = {}
+        try:
+            params = json.loads(argv.custom_action_param or "{}")
+        except json.JSONDecodeError:
+            logger.warning("ProduceChooseIdolFind: 自定义参数不是合法 JSON，改用节点默认参数")
+        if not isinstance(params, dict):
+            params = {}
+        if not params.get("idol_name"):
+            node = context.get_node_data("ProduceChooseIdol") or {}
+            defaults = (node.get("recognition") or {}).get("param") or {}
+            raw = defaults.get("custom_recognition_param")
+            if isinstance(raw, str):
+                try:
+                    raw = json.loads(raw)
+                except json.JSONDecodeError:
+                    raw = None
+            params = raw if isinstance(raw, dict) else {}
+        return params.get("idol_name", ""), params.get("song_name", "")
+
+    def _ocr(self, context: Context, image, expected, roi):
+        detail = context.run_recognition(
+            "ProduceChooseIdolOcr",
+            image,
+            pipeline_override={
+                "ProduceChooseIdolOcr": {
+                    "recognition": "OCR",
+                    "expected": expected,
+                    "roi": roi,
+                }
+            },
+        )
+        return getattr(detail, "all_results", None) or []
+
+    @staticmethod
+    def _find_box(results, text, min_score=0.7):
+        best, best_score = None, 0.0
+        for item in results:
+            score = similarity_ratio(getattr(item, "text", ""), text)
+            if score >= min_score and score > best_score:
+                best, best_score = item, score
+        return best
+
+    def _read_panel(self, context: Context, image, roi=None):
+        detail = context.run_recognition(
+            "ProduceChooseIdolPanel",
+            image,
+            pipeline_override={
+                "ProduceChooseIdolPanel": {
+                    "recognition": "OCR",
+                    "expected": [self.idol_name, self.song_name],
+                    "roi": roi or self.PANEL_ROI,
+                }
+            },
+        )
+        return line_candidates(getattr(detail, "all_results", None))
+
+    def _matches(self, candidates) -> bool:
+        name_text, name_score = best_match(candidates, self.idol_name, similarity_ratio)
+        song_text, song_score = best_match(candidates, self.song_name, song_similarity_ratio)
+        self.last_match = (name_text, name_score, song_text, song_score)
+        return name_score >= SIMILARITY_THRESHOLD and song_score >= SIMILARITY_THRESHOLD
+
+    @staticmethod
+    def _is_checked(image, x, y) -> bool:
+        # 勾选后是蓝色方块（B 通道明显高于 R），未勾选是灰色
+        patch = image[max(0, y - 4) : y + 4, max(0, x - 4) : x + 4]
+        if patch.size == 0:
+            return False
+        b = float(patch[:, :, 0].mean())
+        r = float(patch[:, :, 2].mean())
+        return b - r > 40
+
+    def _grid_signature(self, image):
+        x, y, w, h = self.GRID_ROI
+        region = image[y : y + h, x : x + w]
+        step_y = max(1, region.shape[0] // 16)
+        step_x = max(1, region.shape[1] // 16)
+        return region[::step_y, ::step_x].astype("int64").sum()
+
+    def _locate(self, context, controller, expected, text):
+        """在筛选弹窗里滚动查找文本，找到返回 OCR 结果项，找不到返回 None。"""
+        for _ in range(3):  # 先滚回顶部，消除上次残留位置
+            controller.post_swipe(400, 450, 400, 900, 400).wait()
+            time.sleep(0.25)
+        for _ in range(8):
+            image = controller.post_screencap().wait().get()
+            if image is None or image.size == 0:
+                return None
+            box = self._find_box(self._ocr(context, image, expected, self.DIALOG_ROI), text)
+            if box is not None:
+                return box
+            controller.post_swipe(400, 800, 400, 550, 400).wait()
+            time.sleep(0.35)
+        return None
+
+    def _reset_filter(self, context, controller) -> None:
+        """退回全选状态，保证后面的全量扫描能看到所有偶像卡。"""
+        controller.post_click(*self.IDOL_DIALOG_POINT).wait()
+        time.sleep(self.DIALOG_DELAY)
+        controller.post_click(*self.FILTER_TAB_POINT).wait()
+        time.sleep(self.DIALOG_DELAY)
+        select_all = self._locate(context, controller, ["全选"], "全选")
+        if select_all is not None:
+            x, y, w, h = select_all.box
+            controller.post_click(x + w // 2, y + h // 2).wait()
+            time.sleep(self.CLICK_DELAY)
+        controller.post_click(*self.DIALOG_CONFIRM_POINT).wait()
+        time.sleep(self.DIALOG_DELAY)
+        controller.post_click(*self.OVERVIEW_POINT).wait()
+        time.sleep(self.DIALOG_DELAY)
+
+    def _filter_idol(self, context, controller) -> bool:
+        for attempt in range(1, 4):
+            if self._filter_once(context, controller):
+                return True
+            logger.warning(f"ProduceChooseIdolFind: 第 {attempt} 次偶像筛选未命中，重试")
+            controller.post_click(85, 1195).wait()  # 宫格页左下返回键，退回选择页
+            time.sleep(self.DIALOG_DELAY)
+        return False
+
+    def _filter_once(self, context, controller) -> bool:
+        """把列表筛选成只显示目标偶像，成功返回 True。"""
+        controller.post_click(*self.IDOL_DIALOG_POINT).wait()
+        time.sleep(self.DIALOG_DELAY)
+        controller.post_click(*self.FILTER_TAB_POINT).wait()
+        time.sleep(self.DIALOG_DELAY)
+
+        clear_box = self._locate(context, controller, ["全部解除"], "全部解除")
+        if clear_box is not None:
+            x, y, w, h = clear_box.box
+            controller.post_click(x + w // 2, y + h // 2).wait()
+            time.sleep(self.CLICK_DELAY)
+
+        # 解除后列表会重新排布，必须重新定位
+        idol_box = self._locate(context, controller, [self.idol_name], self.idol_name)
+        if idol_box is None:
+            logger.warning(f"ProduceChooseIdolFind: 筛选列表里没找到偶像「{self.idol_name}」")
+            return False
+
+        x, y, w, h = idol_box.box
+        # 勾选框固定两列，用列位置算中心，比按文本偏移更稳
+        checkbox = (self.LEFT_CHECKBOX_X if x < 360 else self.RIGHT_CHECKBOX_X, y + h // 2)
+        controller.post_click(*checkbox).wait()
+        time.sleep(self.CLICK_DELAY)
+
+        controller.post_click(*self.DIALOG_CONFIRM_POINT).wait()
+        time.sleep(self.DIALOG_DELAY)
+
+        controller.post_click(*self.OVERVIEW_POINT).wait()
+        time.sleep(self.DIALOG_DELAY)
+
+        # 校验筛选结果：点开第一张卡，读顶部名称确认确实只剩目标偶像
+        image = controller.post_screencap().wait().get()
+        if image is None or image.size == 0:
+            return False
+        controller.post_click(*self.CARD_SLOTS[0]).wait()
+        time.sleep(self.CLICK_DELAY)
+        name_text, name_score = '', 0.0
+        for _ in range(3):
+            image = controller.post_screencap().wait().get()
+            if image is None or image.size == 0:
+                return False
+            name_text, name_score = best_match(
+                self._read_panel(context, image), self.idol_name, similarity_ratio
+            )
+            if name_score >= SIMILARITY_THRESHOLD:
+                break
+            time.sleep(0.6)
+        if name_score < SIMILARITY_THRESHOLD:
+            logger.warning(
+                f"ProduceChooseIdolFind: 偶像筛选未生效（读到 {name_text or '空'}，相似度 {name_score:.2f}）"
+            )
+            return False
+        logger.info(f"已按偶像筛选: {self.idol_name}（{name_text} 相似度 {name_score:.2f}）")
+        return True
+
+    def _confirm(self, context: Context, controller) -> bool:
+        controller.post_click(*self.CONFIRM_POINT).wait()
+        time.sleep(self.CONFIRM_DELAY)
+        image = controller.post_screencap().wait().get()
+        if image is None or image.size == 0:
+            return False
+        return self._matches(self._read_panel(context, image, self.CONFIRM_CHECK_ROI))
+
+    # ------------------------------------------------------------------- run
+
+    def run(self, context: Context, argv: CustomAction.RunArg) -> bool:
+        self.idol_name, self.song_name = self._load_params(context, argv)
+        if not self.idol_name or not self.song_name:
+            logger.error("ProduceChooseIdolFind: 缺少偶像名称或歌曲名称参数")
+            return False
+
+        controller = context.tasker.controller
+        if not self._filter_idol(context, controller):
+            logger.warning("ProduceChooseIdolFind: 偶像筛选失败，回退到全量扫描")
+            self._reset_filter(context, controller)
+
+        image = controller.post_screencap().wait().get()
+        if image is None or image.size == 0:
+            return False
+        logger.info(f"开始查找偶像卡: {self.idol_name} / {self.song_name}")
+
+        for page in range(1, self.MAX_PAGES + 1):
+            for index, (x, y) in enumerate(self.CARD_SLOTS, start=1):
+                if not controller.post_click(x, y).wait():
+                    logger.warning(f"ProduceChooseIdolFind: 点击卡片失败 {x},{y}")
+                    continue
+                time.sleep(self.CLICK_DELAY)
+                image = controller.post_screencap().wait().get()
+                if image is None or image.size == 0:
+                    return False
+
+                if not self._matches(self._read_panel(context, image)):
+                    continue
+
+                name_text, name_score, song_text, song_score = self.last_match
+                logger.info(
+                    f"候选偶像卡: {name_text} / {song_text}（第 {page} 页第 {index} 张），"
+                    f"相似度 {name_score:.2f}/{song_score:.2f}"
+                )
+                if self._confirm(context, controller):
+                    logger.info(f"已选择偶像卡: {self.idol_name} / {self.song_name}")
+                    return True
+
+                logger.warning("确认后顶部信息与目标不一致，重新打开概览继续查找")
+                controller.post_click(*self.OVERVIEW_POINT).wait()
+                time.sleep(self.SWIPE_DELAY)
+                image = controller.post_screencap().wait().get()
+                if image is None or image.size == 0:
+                    return False
+
+            before = self._grid_signature(image)
+            controller.post_swipe(*self.SWIPE_FROM, *self.SWIPE_TO, 500).wait()
+            time.sleep(self.SWIPE_DELAY)
+            image = controller.post_screencap().wait().get()
+            if image is None or abs(self._grid_signature(image) - before) < 1000:
+                logger.info("ProduceChooseIdolFind: 已翻到列表末尾，未找到目标偶像卡")
+                return False
+
+        logger.warning(f"ProduceChooseIdolFind: 翻页 {self.MAX_PAGES} 页仍未找到 {self.idol_name}/{self.song_name}")
+        return False
